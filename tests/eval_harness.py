@@ -20,8 +20,8 @@ GENERATED_DIR = "tests/generated"
 RESULT_FILE = "tests/result.json"
 
 server_params = StdioServerParameters(
-    command="node",  # Executable
-    args=["/Users/cj/gh/gemini-api-docs-demo-typescript/packages/mcp-server/dist/index.js"],  # MCP Server
+    command="python3",  # Executable
+    args=["-m", "gemini_docs_mcp.server"],  # MCP Server
     env=None,  # Optional environment variables
 )
 
