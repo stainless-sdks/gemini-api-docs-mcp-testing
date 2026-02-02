@@ -7,6 +7,7 @@ import shutil
 import argparse
 import re
 import datetime
+import time
 from google import genai
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -19,8 +20,8 @@ GENERATED_DIR = "tests/generated"
 RESULT_FILE = "tests/result.json"
 
 server_params = StdioServerParameters(
-    command="python3",  # Executable
-    args=["-m", "gemini_docs_mcp.server"],  # MCP Server
+    command="node",  # Executable
+    args=["/Users/cj/gh/gemini-api-docs-demo-typescript/packages/mcp-server/dist/index.js"],  # MCP Server
     env=None,  # Optional environment variables
 )
 
@@ -230,6 +231,7 @@ async def main():
             language = test_case.get('language', 'python') # Default to python if missing
             
             print(f"\nTest: {test_id} ({language})")
+            start_time = time.monotonic()
             try:
                 code = await generate_code(test_case['prompt'], language, client, session)
                 script_path = save_code(code, test_id, language)
@@ -253,6 +255,10 @@ async def main():
             except Exception as e:
                 print(f"  ERROR during test execution: {e}")
                 results[test_id] = {"passed": False, "error": str(e)}
+            finally:
+                duration_seconds = time.monotonic() - start_time
+                results.setdefault(test_id, {})
+                results[test_id]["duration_seconds"] = round(duration_seconds, 4)
 
     print("\n=== Evaluation Summary ===")
     passed_count = sum(1 for r in results.values() if r.get('passed') is True)
@@ -288,6 +294,7 @@ async def main():
             "failed": failed_count,
             "skipped": skipped_count
         },
+        "results": results,
         "failures": failures
     }
 

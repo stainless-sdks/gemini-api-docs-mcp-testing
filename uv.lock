@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.10"
 
 [[package]]
@@ -447,6 +447,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "sqlite-utils" },
+    { name = "uvicorn" },
 ]
 
 [package.dev-dependencies]
@@ -461,6 +462,7 @@ requires-dist = [
     { name = "fastmcp" },
     { name = "httpx" },
     { name = "sqlite-utils" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata.requires-dev]
