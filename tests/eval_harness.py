@@ -27,6 +27,33 @@ server_params = StdioServerParameters(
 
 # --- Code Extraction & Analysis Utils ---
 
+def extract_tool_calls(response) -> List[Dict[str, Any]]:
+    """Extracts tool calls from the automatic function calling history."""
+    tool_calls = []
+    if hasattr(response, 'automatic_function_calling_history') and response.automatic_function_calling_history:
+        for content in response.automatic_function_calling_history:
+            if content.parts:
+                for part in content.parts:
+                    if hasattr(part, 'function_call') and part.function_call:
+                        tool_calls.append({
+                            "name": part.function_call.name,
+                            "args": dict(part.function_call.args) if part.function_call.args else {}
+                        })
+                    if hasattr(part, 'function_response') and part.function_response:
+                        # Find the matching call and add response
+                        for tc in reversed(tool_calls):
+                            if tc["name"] == part.function_response.name and "response" not in tc:
+                                # Convert response to a JSON-serializable format
+                                response = part.function_response.response
+                                if hasattr(response, 'model_dump'):
+                                    tc["response"] = response.model_dump()
+                                elif hasattr(response, '__dict__'):
+                                    tc["response"] = response.__dict__
+                                else:
+                                    tc["response"] = str(response)
+                                break
+    return tool_calls
+
 def extract_code_py(response_str: str) -> str:
     """Extracts code for the given language from the response."""
     re_pattern = rf'```python\n.*?\n\s*```'
@@ -146,12 +173,12 @@ def load_prompts() -> List[Dict[str, Any]]:
     with open(PROMPTS_FILE, 'r') as f:
         return json.load(f)
 
-async def generate_code(prompt:str, language: str, client:genai.Client, mcp_session:ClientSession, retries=3) -> str:
+async def generate_code(prompt:str, language: str, client:genai.Client, mcp_session:ClientSession, retries=3) -> tuple[str, List[Dict[str, Any]]]:
     print(f"Generating code for ({language}): {prompt[:50]}...")
 
     for attempt in range(retries + 1):
         try:
-            # Use a model that's good at coding. 
+            # Use a model that's good at coding.
             response = await client.aio.models.generate_content(
                 model=MODEL_NAME,
                 contents=prompt,
@@ -160,7 +187,8 @@ async def generate_code(prompt:str, language: str, client:genai.Client, mcp_sess
                   temperature=0.1 # Lower temperature for more deterministic code
                 )
             )
-            return extract_code(response.text, language)
+            tool_calls = extract_tool_calls(response)
+            return extract_code(response.text, language), tool_calls
         except Exception as e:
             error_str = str(e)
             # Retry on 5XX errors or generic "Internal" errors
@@ -173,7 +201,7 @@ async def generate_code(prompt:str, language: str, client:genai.Client, mcp_sess
                 if attempt == retries and is_5xx:
                      print(f"  ERROR: Failed after {retries+1} attempts.")
                 raise e
-    return ""
+    return "", []
 
 def save_code(code: str, test_id: str, language: str) -> str:
     ext = "py" if language == "python" else "ts"
@@ -213,10 +241,13 @@ def validate_execution_result(stdout: str, stderr: str, returncode: int) -> bool
 async def main():
     parser = argparse.ArgumentParser(description="Gemini Docs MCP Eval Harness")
     parser.add_argument('--mode', choices=['execute', 'static'], default='static', help='Evaluation mode')
+    parser.add_argument('--limit', '-n', type=int, default=None, help='Limit number of tests to run')
     args = parser.parse_args()
 
     setup_directories()
     prompts = load_prompts()
+    if args.limit:
+        prompts = prompts[:args.limit]
     client = genai.Client()
     
     results = {}
@@ -232,29 +263,38 @@ async def main():
             
             print(f"\nTest: {test_id} ({language})")
             start_time = time.monotonic()
+            tool_calls = []
             try:
-                code = await generate_code(test_case['prompt'], language, client, session)
+                code, tool_calls = await generate_code(test_case['prompt'], language, client, session)
                 script_path = save_code(code, test_id, language)
-                
+
+                # Print tool calls
+                if tool_calls:
+                    print(f"  Tool calls ({len(tool_calls)}):")
+                    for tc in tool_calls:
+                        print(f"    - {tc['name']}({', '.join(f'{k}={repr(v)[:50]}' for k, v in tc.get('args', {}).items())})")
+                else:
+                    print("  Tool calls: none")
+
                 if args.mode == 'static':
                     analysis_result = analyze_code(code, language)
                     passed = (analysis_result == 'new_sdk')
-                    results[test_id] = {"passed": passed, "analysis": analysis_result, "script": script_path}
+                    results[test_id] = {"passed": passed, "analysis": analysis_result, "script": script_path, "tool_calls": tool_calls}
                     print(f"  Analysis: {analysis_result} -> {'PASSED' if passed else 'FAILED'}")
 
                 elif args.mode == 'execute':
                     if language == 'python':
                         stdout, stderr, returncode = execute_code(script_path)
                         passed = validate_execution_result(stdout, stderr, returncode)
-                        results[test_id] = {"passed": passed, "script": script_path}
+                        results[test_id] = {"passed": passed, "script": script_path, "tool_calls": tool_calls}
                         print(f"  Execution -> {'PASSED' if passed else 'FAILED'}")
                     else:
                         print(f"  SKIPPED (Execution not supported for {language})")
-                        results[test_id] = {"passed": None, "status": "skipped_execution"}
+                        results[test_id] = {"passed": None, "status": "skipped_execution", "tool_calls": tool_calls}
 
             except Exception as e:
                 print(f"  ERROR during test execution: {e}")
-                results[test_id] = {"passed": False, "error": str(e)}
+                results[test_id] = {"passed": False, "error": str(e), "tool_calls": tool_calls}
             finally:
                 duration_seconds = time.monotonic() - start_time
                 results.setdefault(test_id, {})
@@ -283,7 +323,8 @@ async def main():
                 "prompt": test_case.get('prompt', 'unknown'),
                 "error": result.get('error'),
                 "analysis": result.get('analysis'),
-                "script": result.get('script')
+                "script": result.get('script'),
+                "tool_calls": result.get('tool_calls', [])
             }
             failures.append(failure_entry)
 
