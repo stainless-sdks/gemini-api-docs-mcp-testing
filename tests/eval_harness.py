@@ -8,9 +8,11 @@ import argparse
 import re
 import datetime
 import time
+from contextlib import asynccontextmanager
 from google import genai
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 from typing import Dict, Any, List, Optional
 
 # Configuration
@@ -19,11 +21,51 @@ PROMPTS_FILE = "tests/test_prompts.json"
 GENERATED_DIR = "tests/generated"
 RESULT_FILE = "tests/result.json"
 
-server_params = StdioServerParameters(
-    command="python3",  # Executable
-    args=["-m", "gemini_docs_mcp.server"],  # MCP Server
-    env=None,  # Optional environment variables
-)
+# Default stdio server params (used when --transport=stdio)
+DEFAULT_STDIO_COMMAND = "python3"
+DEFAULT_STDIO_ARGS = ["-m", "gemini_docs_mcp.server"]
+
+# Default HTTP server URL (used when --transport=http)
+DEFAULT_HTTP_URL = "http://localhost:8000/mcp"
+
+
+@asynccontextmanager
+async def get_mcp_session(transport: str, url: str | None = None, headers: dict | None = None):
+    """
+    Create an MCP session using either stdio or HTTP transport.
+
+    Args:
+        transport: Either "stdio" or "http"
+        url: HTTP endpoint URL (required for http transport)
+        headers: Optional headers for HTTP transport (e.g., auth)
+
+    Yields:
+        ClientSession connected to the MCP server
+    """
+    if transport == "stdio":
+        server_params = StdioServerParameters(
+            command=DEFAULT_STDIO_COMMAND,
+            args=DEFAULT_STDIO_ARGS,
+            env=None,
+        )
+        async with stdio_client(server_params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+    elif transport == "http":
+        if not url:
+            raise ValueError("URL is required for HTTP transport")
+        async with streamablehttp_client(
+            url=url,
+            headers=headers,
+            timeout=30,
+            sse_read_timeout=300,
+        ) as (read_stream, write_stream, get_session_id):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+                yield session
+    else:
+        raise ValueError(f"Unknown transport: {transport}")
 
 # --- Code Extraction & Analysis Utils ---
 
@@ -242,7 +284,24 @@ async def main():
     parser = argparse.ArgumentParser(description="Gemini Docs MCP Eval Harness")
     parser.add_argument('--mode', choices=['execute', 'static'], default='static', help='Evaluation mode')
     parser.add_argument('--limit', '-n', type=int, default=None, help='Limit number of tests to run')
+    parser.add_argument('--transport', choices=['stdio', 'http'], default='stdio',
+                        help='MCP transport type (default: stdio)')
+    parser.add_argument('--url', type=str, default=DEFAULT_HTTP_URL,
+                        help=f'MCP server URL for HTTP transport (default: {DEFAULT_HTTP_URL})')
+    parser.add_argument('--header', action='append', dest='headers', metavar='KEY=VALUE',
+                        help='HTTP header for authentication (can be specified multiple times)')
     args = parser.parse_args()
+
+    # Parse headers from KEY=VALUE format
+    http_headers = {}
+    if args.headers:
+        for header in args.headers:
+            if '=' in header:
+                key, value = header.split('=', 1)
+                http_headers[key.strip()] = value.strip()
+            else:
+                print(f"Warning: Ignoring malformed header '{header}' (expected KEY=VALUE)")
+    http_headers = http_headers or None
 
     setup_directories()
     prompts = load_prompts()
@@ -252,11 +311,11 @@ async def main():
     
     results = {}
     
-    print(f"=== Starting Evaluation (Mode: {args.mode}) ===")
+    print(f"=== Starting Evaluation (Mode: {args.mode}, Transport: {args.transport}) ===")
+    if args.transport == "http":
+        print(f"    URL: {args.url}")
 
-    async with stdio_client(server_params) as (read, write):
-      async with ClientSession(read, write) as session:
-        await session.initialize()
+    async with get_mcp_session(args.transport, url=args.url, headers=http_headers) as session:
         for test_case in prompts:
             test_id = test_case.get('id', 'unknown')
             language = test_case.get('language', 'python') # Default to python if missing
